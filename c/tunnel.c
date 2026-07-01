@@ -13,6 +13,15 @@
 
 static void ssh_tunnel_disconnect(tunnel_t *tunnel);
 
+/* 无channel时read_event被暂时摘除，由此时器在100ms后重新arm。
+ * 避免SSH socket上非 channel包(GLOBAL_REQUEST 等)未消费时
+ * EV_PERSIST持续触发on_readable造成100% CPU忙等。 */
+static void ssh_tunnel_rearm_read_cb(int fd, short what, void *arg)
+{
+	(void)fd; (void)what;
+	tunnel_t *tunnel = arg;
+	event_add(&tunnel->read_event, NULL);
+}
 
 static void ssh_tunnel_on_readable(int fd, short what, void *arg)
 {
@@ -159,6 +168,10 @@ static void ssh_tunnel_reconnect_cb(int fd, short what, void *arg)
 	struct timeval ktv = { .tv_sec = tunnel->keepalive_interval, .tv_usec = 0 };
 	evtimer_add(&tunnel->keepalive_timer, &ktv);
 
+	// initialize read rearm timer (reconnect path)
+	evtimer_set(&tunnel->read_rearm_timer, ssh_tunnel_rearm_read_cb, tunnel);
+	event_base_set(tunnel->base, &tunnel->read_rearm_timer);
+
 	return;
 
 reconnect_fail:
@@ -213,6 +226,10 @@ static void ssh_tunnel_disconnect(tunnel_t *tunnel)
 	// unregister I/O events
 	if (event_initialized(&tunnel->read_event)) {
         event_del(&tunnel->read_event);
+    }
+
+	if (event_initialized(&tunnel->read_rearm_timer)) {
+        event_del(&tunnel->read_rearm_timer);
     }
 
 	if (tunnel->write_registered && event_initialized(&tunnel->write_event)) {
@@ -346,6 +363,10 @@ int ssh_tunnel_init(tunnel_t *tunnel, struct event_base *base,
 	event_base_set(base, &tunnel->write_event);
 	tunnel->write_registered = 0;
 
+	// initialize read rearm timer (for deferring read_event when no channels)
+	evtimer_set(&tunnel->read_rearm_timer, ssh_tunnel_rearm_read_cb, tunnel);
+	event_base_set(base, &tunnel->read_rearm_timer);
+
 	// initialize keepalive timer
 	evtimer_set(&tunnel->keepalive_timer, ssh_tunnel_keepalive_cb, tunnel);
 	event_base_set(base, &tunnel->keepalive_timer);
@@ -384,6 +405,9 @@ void ssh_tunnel_term(tunnel_t *tunnel)
 		if (event_initialized(&tunnel->reconnect_timer)) {
             event_del(&tunnel->reconnect_timer);
         }
+		if (event_initialized(&tunnel->read_rearm_timer)) {
+            event_del(&tunnel->read_rearm_timer);
+        }
 		return;
 	}
 
@@ -395,6 +419,11 @@ void ssh_tunnel_term(tunnel_t *tunnel)
 	// stop keepalive timer
 	if (event_initialized(&tunnel->keepalive_timer)) {
         event_del(&tunnel->keepalive_timer);
+    }
+
+	// stop read rearm timer
+	if (event_initialized(&tunnel->read_rearm_timer)) {
+        event_del(&tunnel->read_rearm_timer);
     }
 
 	// close all channels
@@ -660,6 +689,22 @@ void ssh_tunnel_process_channels(tunnel_t *tunnel)
 	if (!tunnel->connected || !tunnel->session) {
         return;
     }
+
+	/* 无channel时SSH socket 上的非channel 包(GLOBAL_REQUEST、keepalive 回复等)
+	 * 无法被channel_read消费，EV_PERSIST会持续触发on_readable造成忙等。
+	 * 暂时摘除read_event，100ms后由 read_rearm_timer重新arm。
+	 * 有channel时channel_read会顺带消费 transport，不进入此分支。
+	 *
+	 * 注意：libssh2 1.11.1公开API中只有channel_read会读transport层，
+	 * keepalive_send/transport_send均为纯发送，不消费输入队列。
+	 * 因此无channel时无法主动drain，只能靠低频rearm避免忙等；
+	 * session致命错误检测由keepalive_timer的keepalive_send在发送失败时触发。 */
+	if (list_empty(&tunnel->channels)) {
+		event_del(&tunnel->read_event);
+		struct timeval rv = { .tv_sec = 0, .tv_usec = 100000 }; /* 100ms */
+		evtimer_add(&tunnel->read_rearm_timer, &rv);
+		return;
+	}
 
 	ssh_channel_t *ch, *tmp;
 	int any_progress;

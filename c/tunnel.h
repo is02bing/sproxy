@@ -63,6 +63,7 @@ typedef struct tunnel_t {
 	/* events */
 	struct event       read_event;
 	struct event       write_event;
+	struct event       read_rearm_timer;  /* 无 channel 时延迟重新 arm read_event */
 	int                write_registered;
 
 	/* channel list */
