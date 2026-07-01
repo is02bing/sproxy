@@ -16,14 +16,15 @@ use signal_hook::low_level::pipe;
 use std::collections::{HashMap, HashSet};
 use std::env::args;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::os::raw::{c_int, c_uint};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type SharedBool = Arc<AtomicBool>;
 
@@ -42,6 +43,8 @@ struct Config {
     dns: DnsConfig,
     #[serde(default)]
     proxy: ProxyConfig,
+    #[serde(default)]
+    probe: ProbeConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,11 +142,27 @@ struct DnsServerConfig {
     proxy: bool,
 }
 
+//补充探活配置：通过本地 socks5 经隧道连接 ssh_server:port，验证端到端可达
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct ProbeConfig {
+    enable: bool,
+    interval: u64,  // 秒，探活间隔
+    timeout: u64,   // 秒，单次探活超时
+}
+impl Default for ProbeConfig {
+    fn default() -> Self {
+        Self { enable: false, interval: 60, timeout: 5 }
+    }
+}
+
 /// 运行时共享状态
 struct AppState {
     rules_active: SharedBool,
     tproxy_port: u16,
     ssh_server_ip: Option<String>,
+    ssh_port: u16,
+    socks5_listen: Option<String>,
     dns_listen: Option<String>,
     dns_client_port: u16,
     cidr_bypass_path: String,
@@ -152,6 +171,10 @@ struct AppState {
     /// 原始 DNS 服务器配置（match, server, proxy），`@goproxy` 为字面占位符，
     /// 在 startup / reload 时展开为实际 goproxy 域名关键词
     dns_raw: Vec<(String, String, bool)>,
+    /// 补充探活配置
+    probe_enable: bool,
+    probe_interval: Duration,
+    probe_timeout: Duration,
 }
 
 impl AppState {
@@ -276,12 +299,17 @@ fn init_state(config: &Config) -> Result<AppState> {
         rules_active: Arc::new(AtomicBool::new(false)),
         tproxy_port: config.tproxy.port,
         ssh_server_ip: config.ssh.host.clone(),
+        ssh_port: config.ssh.port,
+        socks5_listen: config.socks5.listen.clone(),
         dns_listen: config.dns.listen.clone(),
         dns_client_port: config.dns.client,
         cidr_bypass_path: config.proxy.cidr.bypass.clone(),
         cidr_goproxy_path: config.proxy.cidr.goproxy.clone(),
         auto_path: config.proxy.auto.clone(),
         dns_raw: collect_dns_raw(config),
+        probe_enable: config.probe.enable,
+        probe_interval: Duration::from_secs(config.probe.interval),
+        probe_timeout: Duration::from_secs(config.probe.timeout),
     })
 }
 
@@ -361,15 +389,41 @@ fn event_loop(state: &AppState, signal_rx: &mut UnixStream) -> Result<()> {
     let signal_fd = signal_rx.as_raw_fd();
     let mut buffer = [0u8; 4096];
 
+    // 补充探活调度：仅当 probe.enable 且 socks5 与 ssh host 均已配置时启用。
+    // 启用后 poll 使用有限超时，到期触发一次 socks5 端到端探活。
+    let probe_ready = state.probe_enable
+        && state.socks5_listen.is_some()
+        && state.ssh_server_ip.is_some();
+    if state.probe_enable && !probe_ready {
+        log_warn!("probe enabled but socks5/ssh.host missing, probe disabled");
+    }
+    let mut next_probe: Option<Instant> = if probe_ready {
+        log_info!("probe scheduled: interval={}s timeout={}s via socks5 -> {}:{}",
+                  state.probe_interval.as_secs(), state.probe_timeout.as_secs(),
+                  state.ssh_server_ip.as_deref().unwrap_or("?"), state.ssh_port);
+        Some(Instant::now() + state.probe_interval)
+    } else {
+        None
+    };
+
     loop {
-        // 同时 poll inotify、隧道唤醒管道与信号 fd，阻塞直到任一就绪（无周期轮询）
+        // 计算 poll 超时：探活启用时取到下次探活的剩余毫秒数，否则无限阻塞
+        let poll_timeout: c_int = match next_probe {
+            Some(np) => {
+                let now = Instant::now();
+                if now >= np { 0 } else { np.duration_since(now).as_millis().min(i32::MAX as u128) as c_int }
+            }
+            None => -1,
+        };
+
+        // 同时 poll inotify、隧道唤醒管道与信号 fd
         let inotify_fd = inotify.as_raw_fd();
         let mut pfds = [
             PollFd { fd: inotify_fd, events: POLLIN, revents: 0 },
             PollFd { fd: wake_fd, events: POLLIN, revents: 0 },
             PollFd { fd: signal_fd, events: POLLIN, revents: 0 },
         ];
-        let ret = unsafe { poll(pfds.as_mut_ptr(), pfds.len() as c_uint, -1) };
+        let ret = unsafe { poll(pfds.as_mut_ptr(), pfds.len() as c_uint, poll_timeout) };
 
         if ret < 0 {
             let err = std::io::Error::last_os_error();
@@ -377,6 +431,22 @@ fn event_loop(state: &AppState, signal_rx: &mut UnixStream) -> Result<()> {
                 continue;
             }
             return Err(anyhow::Error::new(err).context("poll failed"));
+        }
+
+        // 检查所有 fd 的 revents，非 POLLIN 的异常标志（POLLERR/POLLHUP/POLLNVAL 等）记录 warning
+        for (i, pfd) in pfds.iter().enumerate() {
+            let extra = pfd.revents & !POLLIN;
+            if extra != 0 {
+                log_warn!("poll fd[{}] (fd={}) non-POLLIN revents: 0x{:x}", i, pfd.fd, extra);
+            }
+        }
+
+        // 补充探活：到期时执行一次 socks5 端到端探活，据此管理 nft 规则
+        if let Some(np) = next_probe {
+            if Instant::now() >= np {
+                run_probe(state);
+                next_probe = Some(Instant::now() + state.probe_interval);
+            }
         }
 
         // 信号到达：drain 管道后优雅退出，由 main 统一清理
@@ -463,6 +533,101 @@ fn event_loop(state: &AppState, signal_rx: &mut UnixStream) -> Result<()> {
     }
 }
 
+/// 探活：通过本地socks5经SSH隧道连接 ssh_server:ssh_port，
+/// 验证端到端可达。探活成功且规则未激活则注入；探活失败且规则已激活则清理。
+fn run_probe(state: &AppState) {
+    let (socks5_addr, target_ip) = match (&state.socks5_listen, &state.ssh_server_ip) {
+        (Some(s), Some(ip)) => (s.as_str(), ip.as_str()),
+        _ => return,
+    };
+    let ok = socks5_probe(socks5_addr, target_ip, state.ssh_port, state.probe_timeout);
+    if ok {
+        log_info!("probe: tunnel healthy (socks5 -> {}:{} via tunnel ok)", target_ip, state.ssh_port);
+        if !state.rules_active.load(Ordering::SeqCst) {
+            let ctx = state.tproxy_ctx();
+            proxy::apply_tproxy_rules(&ctx);
+        }
+    } else {
+        log_warn!("probe: tunnel unhealthy (socks5 -> {}:{} via tunnel failed)", target_ip, state.ssh_port);
+        if state.rules_active.load(Ordering::SeqCst) {
+            match cleanup_tproxy_rules() {
+                Ok(_) => {
+                    log_info!("probe: nft ruleset cleaned due to probe failure");
+                    state.rules_active.store(false, Ordering::SeqCst);
+                }
+                Err(e) => log_error!("probe: nft ruleset clean failed: {}", e),
+            }
+        }
+    }
+}
+
+// SOCKS5 探活：连接本地 socks5 代理，完成无认证握手后发起 CONNECT 到
+// (target_ip, target_port)。C 侧会经 SSH 隧道开 direct-tcpip channel，
+// 成功返回 true 表示隧道端到端可达。全程带超时，避免阻塞主循环过久。
+fn socks5_probe(socks5_addr: &str, target_ip: &str, target_port: u16, timeout: Duration) -> bool {
+    let socks5: SocketAddr = match socks5_addr.parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let mut stream = match TcpStream::connect_timeout(&socks5, timeout) {
+        Ok(s) => s,
+        Err(e) => {
+            log_warn!("probe: connect socks5 {} failed: {}", socks5_addr, e);
+            return false;
+        }
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    // 1) method negotiation: VER=5, NMETHODS=1, METHOD=0x00 (no auth)
+    if let Err(e) = stream.write_all(&[0x05, 0x01, 0x00]) {
+        log_warn!("probe: socks5 method write failed: {}", e);
+        return false;
+    }
+    let mut hdr = [0u8; 2];
+    if let Err(e) = stream.read_exact(&mut hdr) {
+        log_warn!("probe: socks5 method read failed: {}", e);
+        return false;
+    }
+    if hdr[0] != 0x05 || hdr[1] != 0x00 {
+        log_warn!("probe: socks5 method rejected (ver={}, method={})", hdr[0], hdr[1]);
+        return false;
+    }
+
+    // 2) CONNECT request: VER=5, CMD=1(CONNECT), RSV=0, ATYP, DST, PORT
+    let mut req: Vec<u8> = vec![0x05, 0x01, 0x00];
+    if let Ok(ip) = target_ip.parse::<std::net::Ipv4Addr>() {
+        req.push(0x01); // ATYP=IPv4
+        req.extend_from_slice(&ip.octets());
+    } else {
+        req.push(0x03); // ATYP=domain
+        req.push(target_ip.len() as u8);
+        req.extend_from_slice(target_ip.as_bytes());
+    }
+    req.push((target_port >> 8) as u8);
+    req.push((target_port & 0xff) as u8);
+    if let Err(e) = stream.write_all(&req) {
+        log_warn!("probe: socks5 connect request write failed: {}", e);
+        return false;
+    }
+
+    // 3) CONNECT response: 只需读前 4 字节 [VER, REP, RSV, ATYP]，REP=0 即成功
+    let mut resp = [0u8; 4];
+    if let Err(e) = stream.read_exact(&mut resp) {
+        log_warn!("probe: socks5 connect response read failed: {}", e);
+        return false;
+    }
+    if resp[0] != 0x05 {
+        log_warn!("probe: socks5 response bad ver={}", resp[0]);
+        return false;
+    }
+    if resp[1] != 0x00 {
+        log_warn!("probe: socks5 connect failed (rep={})", resp[1]);
+        return false;
+    }
+    true
+}
+
 fn path_for_target(target: WatchTarget, state: &AppState) -> Option<String> {
     match target {
         WatchTarget::ResolvConf => Some(resolv::RESOLV_CONF.to_string()),
@@ -526,6 +691,11 @@ fn print_config(config: &Config) {
         None => log_info!("  dns: disabled"),
     }
     log_info!("  log level: {}", config.log.level);
+    if config.probe.enable {
+        log_info!("  probe: enabled (interval={}s, timeout={}s)", config.probe.interval, config.probe.timeout);
+    } else {
+        log_info!("  probe: disabled");
+    }
 }
 
 fn parse_args() -> Result<Config> {

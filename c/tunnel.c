@@ -125,7 +125,10 @@ static void ssh_tunnel_reconnect_cb(int fd, short what, void *arg)
 	}
 
 	//success, configure keepalive
-	libssh2_keepalive_config(tunnel->session, 1, tunnel->keepalive_interval);
+	/* want_reply=0：服务端不回包，避免无 channel 时 keepalive 回复滞留 socket
+	 * 导致 read_event(EV_PERSIST) 忙等。断连检测仍由 keepalive_send 在 socket
+	 * 断开时返回 SOCKET_SEND 触发 keepalive_missed，不依赖回复包。 */
+	libssh2_keepalive_config(tunnel->session, 0, tunnel->keepalive_interval);
 
 	// switch to non-blocking
 	libssh2_session_set_blocking(tunnel->session, 0);
@@ -318,7 +321,7 @@ int ssh_tunnel_init(tunnel_t *tunnel, struct event_base *base,
 	}
 
 	// configure keepalive
-	libssh2_keepalive_config(tunnel->session, 1, tunnel->keepalive_interval);
+	libssh2_keepalive_config(tunnel->session, 0, tunnel->keepalive_interval);
 
 	INFO("ssh: connected and authenticated to %s:%d as %s", host, port, username);
 
